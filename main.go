@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -34,23 +35,29 @@ type connPair struct {
 	upstream net.Conn
 }
 
+type upstreamConfig struct {
+	Addr string
+	User string
+	Pass string
+}
+
 func main() {
-	upstream := resolveUpstreamArg()
-	if upstream == "" {
-		log.Fatal("usage: ./proxy IP:PORT")
+	cfg, err := resolveConfigFromArgs()
+	if err != nil {
+		log.Fatal(err)
 	}
-	if err := validateHostPort(upstream); err != nil {
-		log.Fatalf("invalid upstream %q: %v", upstream, err)
+	if err := validateConfig(cfg); err != nil {
+		log.Fatalf("invalid config: %v", err)
 	}
 
-	// If the process already running, update its upstream and exit.
-	if sendUpdateToRunningProcess(upstream) {
-		log.Printf("updated running proxy upstream to %s", upstream)
+	// If the process is already running, update its upstream and exit.
+	if sendUpdateToRunningProcess(cfg) {
+		log.Printf("updated running proxy upstream to %s", cfg.Addr)
 		return
 	}
 
 	var upstreamValue atomic.Value
-	upstreamValue.Store(upstream)
+	upstreamValue.Store(cfg)
 	registry := &connRegistry{pairs: make(map[uint64]connPair)}
 
 	ln, err := net.Listen("tcp", listenAddr)
@@ -61,7 +68,7 @@ func main() {
 
 	controlLn, err := net.Listen("unix", controlSockPath)
 	if err != nil {
-		// stale socket path from the crashed process
+		// stale socket path from crashed process
 		_ = os.Remove(controlSockPath)
 		controlLn, err = net.Listen("unix", controlSockPath)
 		if err != nil {
@@ -75,7 +82,11 @@ func main() {
 
 	go controlLoop(controlLn, &upstreamValue, registry)
 
-	log.Printf("local SOCKS5 on %s -> upstream SOCKS5 %s", listenAddr, upstream)
+	if cfg.User != "" {
+		log.Printf("local SOCKS5 on %s -> upstream SOCKS5 %s (auth user: %s)", listenAddr, cfg.Addr, cfg.User)
+	} else {
+		log.Printf("local SOCKS5 on %s -> upstream SOCKS5 %s", listenAddr, cfg.Addr)
+	}
 
 	for {
 		clientConn, err := ln.Accept()
@@ -87,24 +98,75 @@ func main() {
 	}
 }
 
-func resolveUpstreamArg() string {
+func resolveConfigFromArgs() (upstreamConfig, error) {
+	var cfg upstreamConfig
+
 	if len(os.Args) > 1 {
-		return strings.TrimSpace(os.Args[1])
+		cfg.Addr = strings.TrimSpace(os.Args[1])
 	}
-	if UpstreamAddr != "" {
-		return strings.TrimSpace(UpstreamAddr)
+	if len(os.Args) > 2 {
+		user, pass, err := parseUserPass(strings.TrimSpace(os.Args[2]))
+		if err != nil {
+			return cfg, err
+		}
+		cfg.User = user
+		cfg.Pass = pass
 	}
-	return strings.TrimSpace(os.Getenv("UPSTREAM_ADDR"))
+
+	if cfg.Addr == "" && UpstreamAddr != "" {
+		cfg.Addr = strings.TrimSpace(UpstreamAddr)
+	}
+	if cfg.Addr == "" {
+		cfg.Addr = strings.TrimSpace(os.Getenv("UPSTREAM_ADDR"))
+	}
+	if cfg.Addr == "" {
+		return cfg, errors.New("usage: ./proxy IP:PORT [user:password]")
+	}
+
+	return cfg, nil
 }
 
-func sendUpdateToRunningProcess(upstream string) bool {
+func parseUserPass(s string) (string, string, error) {
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", errors.New("invalid credentials format; use user:password")
+	}
+	if strings.Contains(parts[0], "\t") || strings.Contains(parts[1], "\t") || strings.Contains(parts[0], "\n") || strings.Contains(parts[1], "\n") {
+		return "", "", errors.New("credentials must not contain tabs/newlines")
+	}
+	return parts[0], parts[1], nil
+}
+
+func validateConfig(cfg upstreamConfig) error {
+	host, port, err := net.SplitHostPort(cfg.Addr)
+	if err != nil {
+		return err
+	}
+	if host == "" {
+		return errors.New("empty host")
+	}
+	portNum, err := strconv.Atoi(port)
+	if err != nil || portNum < 1 || portNum > 65535 {
+		return errors.New("invalid port")
+	}
+	if (cfg.User == "" && cfg.Pass != "") || (cfg.User != "" && cfg.Pass == "") {
+		return errors.New("both user and password must be set")
+	}
+	if len(cfg.User) > 255 || len(cfg.Pass) > 255 {
+		return errors.New("user/password is too long")
+	}
+	return nil
+}
+
+func sendUpdateToRunningProcess(cfg upstreamConfig) bool {
 	conn, err := net.Dial("unix", controlSockPath)
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
 
-	if _, err := conn.Write([]byte(upstream + "\n")); err != nil {
+	line := fmt.Sprintf("%s\t%s\t%s\n", cfg.Addr, cfg.User, cfg.Pass)
+	if _, err := conn.Write([]byte(line)); err != nil {
 		return false
 	}
 
@@ -134,32 +196,29 @@ func handleControlConn(conn net.Conn, upstreamValue *atomic.Value, registry *con
 		return
 	}
 
-	next := strings.TrimSpace(line)
-	if err := validateHostPort(next); err != nil {
+	next, err := parseControlLine(strings.TrimSpace(line))
+	if err != nil || validateConfig(next) != nil {
 		_, _ = conn.Write([]byte("ERR invalid\n"))
 		return
 	}
 
-	old := upstreamValue.Load().(string)
+	old := upstreamValue.Load().(upstreamConfig)
 	upstreamValue.Store(next)
 	registry.closeAll()
-	log.Printf("upstream updated: %s -> %s", old, next)
+	log.Printf("upstream updated: %s -> %s", old.Addr, next.Addr)
 	_, _ = conn.Write([]byte("OK\n"))
 }
 
-func validateHostPort(addr string) error {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return err
+func parseControlLine(line string) (upstreamConfig, error) {
+	parts := strings.SplitN(line, "\t", 3)
+	if len(parts) != 3 {
+		return upstreamConfig{}, errors.New("invalid control message")
 	}
-	if host == "" {
-		return errors.New("empty host")
-	}
-	portNum, err := strconv.Atoi(port)
-	if err != nil || portNum < 1 || portNum > 65535 {
-		return errors.New("invalid port")
-	}
-	return nil
+	return upstreamConfig{
+		Addr: strings.TrimSpace(parts[0]),
+		User: parts[1],
+		Pass: parts[2],
+	}, nil
 }
 
 func handleClient(clientConn net.Conn, upstreamValue *atomic.Value, registry *connRegistry) {
@@ -171,8 +230,8 @@ func handleClient(clientConn net.Conn, upstreamValue *atomic.Value, registry *co
 		return
 	}
 
-	upstreamAddr := upstreamValue.Load().(string)
-	upstreamConn, err := net.Dial("tcp", upstreamAddr)
+	cfg := upstreamValue.Load().(upstreamConfig)
+	upstreamConn, err := net.Dial("tcp", cfg.Addr)
 	if err != nil {
 		log.Printf("upstream dial failed: %v", err)
 		writeSocksReply(clientConn, 0x01)
@@ -183,7 +242,7 @@ func handleClient(clientConn net.Conn, upstreamValue *atomic.Value, registry *co
 	connID := registry.add(clientConn, upstreamConn)
 	defer registry.remove(connID)
 
-	if err := sendUpstreamConnect(upstreamConn, dstAddr); err != nil {
+	if err := sendUpstreamConnect(upstreamConn, dstAddr, cfg); err != nil {
 		log.Printf("upstream connect failed: %v", err)
 		writeSocksReply(clientConn, 0x05)
 		return
@@ -270,9 +329,13 @@ func readClientRequest(conn net.Conn) (string, error) {
 	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
 }
 
-func sendUpstreamConnect(upstreamConn net.Conn, dstAddr string) error {
-	// Upstream greeting: no-auth
-	if _, err := upstreamConn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+func sendUpstreamConnect(upstreamConn net.Conn, dstAddr string, cfg upstreamConfig) error {
+	// Upstream greeting
+	greeting := []byte{0x05, 0x01, 0x00}
+	if cfg.User != "" {
+		greeting = []byte{0x05, 0x02, 0x00, 0x02}
+	}
+	if _, err := upstreamConn.Write(greeting); err != nil {
 		return err
 	}
 
@@ -280,8 +343,19 @@ func sendUpstreamConnect(upstreamConn net.Conn, dstAddr string) error {
 	if _, err := io.ReadFull(upstreamConn, greetResp); err != nil {
 		return err
 	}
-	if greetResp[0] != 0x05 || greetResp[1] != 0x00 {
-		return errors.New("upstream does not accept no-auth")
+	if greetResp[0] != 0x05 {
+		return errors.New("invalid upstream greeting response")
+	}
+
+	switch greetResp[1] {
+	case 0x00:
+		// no-auth selected
+	case 0x02:
+		if err := authUserPass(upstreamConn, cfg.User, cfg.Pass); err != nil {
+			return err
+		}
+	default:
+		return errors.New("upstream does not accept offered auth methods")
 	}
 
 	host, portStr, err := net.SplitHostPort(dstAddr)
@@ -337,6 +411,31 @@ func sendUpstreamConnect(upstreamConn net.Conn, dstAddr string) error {
 	discardPort := make([]byte, 2)
 	_, err = io.ReadFull(upstreamConn, discardPort)
 	return err
+}
+
+func authUserPass(conn net.Conn, user, pass string) error {
+	if user == "" {
+		return errors.New("upstream requested user/password auth, but credentials are empty")
+	}
+
+	req := make([]byte, 0, 3+len(user)+len(pass))
+	req = append(req, 0x01, byte(len(user)))
+	req = append(req, user...)
+	req = append(req, byte(len(pass)))
+	req = append(req, pass...)
+
+	if _, err := conn.Write(req); err != nil {
+		return err
+	}
+
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return err
+	}
+	if resp[0] != 0x01 || resp[1] != 0x00 {
+		return errors.New("upstream user/password auth failed")
+	}
+	return nil
 }
 
 func readHost(r io.Reader, atyp byte) (string, error) {
